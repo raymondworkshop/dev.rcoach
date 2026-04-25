@@ -8,23 +8,23 @@
        > olw run --vault my-wiki or export OLW_VAULT=my-wiki
 
         - Extracts concept names, Creates wiki/sources/Note.md (source summary page)
-            + >  olw ingest --all
+          >  olw ingest --all
         - For each concept, Writes a wiki article with [[wikilinks]] to related concepts
-            + > olw compile
+          > olw compile
         - Updates wiki/index.md (navigation layer)
-            + > olw review        # interactive draft review
+          > olw review        # interactive draft review
          
     - olw query "question" --save 
          
 *  hermes
     - questions
-        + > hermes /llm-wiki query "questions"
+      > hermes /llm-wiki query "questions"
  
     - ingest new content
-        + > hermes /llm-wiki ingest ./path/to/your/note.md
+      > hermes /llm-wiki ingest ./path/to/your/note.md
  
     - maintain
-        + > hermes /llm-wiki lint or hermes /llm-wiki compile
+      > hermes /llm-wiki lint or hermes /llm-wiki compile
          
 
 * review
