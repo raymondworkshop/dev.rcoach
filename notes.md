@@ -5,7 +5,7 @@
     - Drop any .md files into ~/my-wiki/raw/
 
     -  One command: ingest + compile + lint + optional auto-approve
-        - > olw run --vault my-wiki or export OLW_VAULT=my-wiki
+       > olw run --vault my-wiki or export OLW_VAULT=my-wiki
 
         - Extracts concept names, Creates wiki/sources/Note.md (source summary page)
             + >  olw ingest --all
