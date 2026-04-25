@@ -3,7 +3,7 @@
 
 * Drop any .md files into ~/my-wiki/raw/
 
-* use --vault ~/my-wiki or export OLW_VAULT=~/my-wiki
+* use --vault my-wiki or export OLW_VAULT=my-wiki
 
 * One command: ingest + compile + lint + optional auto-approve
     - > olw run
@@ -17,4 +17,3 @@
 
 #### reference
 * [obsidian-llm-wiki](https://github.com/kytmanov/obsidian-llm-wiki-local)
-* 
