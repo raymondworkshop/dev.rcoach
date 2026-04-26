@@ -1,7 +1,7 @@
 
 #### notes 
 - CLAUDE.md defines the personality and rules
-- '/raw' 
+
 
 ####  Directory Structure  
 - `/raw`: All unprocessed inputs (voice transcripts, messy diary entries, meeting notes)
