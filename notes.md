@@ -1,10 +1,18 @@
 
 
 #### notes 
-- gbrain is a second brain with LLM wiki
+- rbrain is a second brain with LLM wiki
     > ingest  
     > query  
     > link  
+
+- pi agent  
+    - Mini local model: gemma3:4b-it-q8_0 
+        - api: http://100.90.225.26:11434 
+        > ollama launch pi  
+    - local run
+        > export OLLAMA_HOST="http://100.90.225.26:11434"  
+        > ollama run rbrain-gemma3
     
 - SKILL.md defines the personality and rules
 
