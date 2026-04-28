@@ -69,7 +69,7 @@ def save_to_wiki(ai_output, source_file, original_date):
                 f.write(f"# {entity}\n")
             f.write(f"\n- **{original_date}**: {insight} (Ref: [[{source_file}]])\n")
 
-def process_file(filename):
+def process_file():
     """使用 os.walk 遍历所有子目录"""
     # 记录已处理文件，防止重复（可选）
     files_to_process = []
@@ -122,5 +122,5 @@ if __name__ == "__main__":
     for file in os.listdir(INPUT_DIR):
         if file.endswith(".md"): process_file(file)
     """
-    filename = "/Users/zhaowenlong/workspace/dev.rbrain/rbrain-wiki/raw/mydiary/diary/2022-03-14-yearly-review.md"
-    process_file(filename)
+    #filename = "/Users/zhaowenlong/workspace/dev.rbrain/rbrain-wiki/raw/mydiary/diary/2022-03-14-yearly-review.md"
+    process_file()
