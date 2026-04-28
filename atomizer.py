@@ -2,7 +2,9 @@
 import os
 import re
 import requests
+import json
 from datetime import datetime
+from pathlib import Path
 
 # --- CONFIGURATION ---
 INPUT_DIR = "./rbrain-wiki/raw"
@@ -13,6 +15,8 @@ OVERLAP = 50
 #client = ollama.Client(host='http://192.168.1.100:11434')     
 
 THEMES = ["self", "relationship", "work", "habit"]
+ENTITY_TAGS = ["#people", "#places", "#objects", "#projects"]
+CONCEPT_TAGS = ["#ideas", "#patterns", "#emotions", "#principles", "#skills", "#states"]
 
 def call_remote_ollama(prompt):
     # 远程服务器的 IP 和端口
@@ -66,31 +70,52 @@ def save_to_wiki(ai_output, source_file, original_date):
             f.write(f"\n- **{original_date}**: {insight} (Ref: [[{source_file}]])\n")
 
 def process_file(filename):
-    file_path = os.path.join(INPUT_DIR, filename)
-    orig_date = extract_original_date(file_path, filename)
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    """使用 os.walk 遍历所有子目录"""
+    # 记录已处理文件，防止重复（可选）
+    files_to_process = []
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for file in files:
+            if file.endswith(".md"):
+                full_path = os.path.join(root, file)
+                # 计算相对路径，方便在 Obsidian 中点击链接
+                rel_path = os.path.relpath(full_path, INPUT_DIR)
+                files_to_process.append((full_path, rel_path, file))
 
-    print(f"\n📂 Source: {filename} | Date: {orig_date}")
+    print(f"🔍 扫描完成，共发现 {len(files_to_process)} 个 Markdown 文件。")
     
-    for i in range(0, len(lines), CHUNK_SIZE - OVERLAP):
-        chunk = "".join(lines[i : i + CHUNK_SIZE])
-        prompt = f"""
-        Extract entities/concepts from the text below.
-        Categories: {THEMES}
-        Mandatory Tag Groups: 
-        - Entities: #people, #places, #objects, #projects
-        - Concepts: #ideas, #patterns, #emotions, #principles, #skills, #states
+    for full_path, rel_path, filename in files_to_process:
+        orig_date = extract_original_date(full_path, filename)
+        
+        with open(full_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        print(f"\n📂 处理中: {rel_path} | 日期: {orig_date}")
+    
+        # 处理超长文件（2000行分块）
+        for i in range(0, len(lines), CHUNK_SIZE - OVERLAP):
+            chunk = "".join(lines[i : i + CHUNK_SIZE])
+            prompt = f"""
+        Task: Extract entities/concepts from the text below.
+        - Themes: {THEMES} 
+        - Entities: {ENTITY_TAGS}
+        - Concepts: {CONCEPT_TAGS}
         AI can add its own if none fit.
         
         OUTPUT: ENTITY | THEME | TAGS | INSIGHT
         TEXT: {chunk}
         """
-        raw_output = call_remote_ollama(prompt)
-        print(f"\nProposed Atoms:\n{raw_output}")
-        #if input("\nSave? (y/n): ").lower() == 'y':
-        save_to_wiki(raw_output, filename, orig_date)
+            
+        result = call_remote_ollama(prompt)
+        print(f"\n--- Proposed Atoms: (chunk {i//(CHUNK_SIZE-OVERLAP) + 1}) ---\n{result}")
+            
+        cmd = input("\n[n]skip the file [exit]exit: ").lower()
+        if cmd == 'n':
+            break
+        elif cmd == 'exit':
+            return
+        else:
+            save_to_wiki(result, rel_path, orig_date)
+
 
 if __name__ == "__main__":
     """
