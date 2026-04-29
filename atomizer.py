@@ -7,12 +7,15 @@ from datetime import datetime
 from pathlib import Path
 
 # --- CONFIGURATION ---
+# 远程服务器的 IP 和端口
+OLLAMA_API = "http://100.90.225.26:11434/api/generate"
+MODEL_NAME = "rbrain-qwen2.5"
 INPUT_DIR = "./rbrain-wiki/raw"
 WIKI_DIR = "./rbrain-wiki/atoms-notes"
-MODEL = "rbrain-qwen2.5"
+LOG_FILE = "atoms_log.json"  # 记录已处理文件的进度
+
 CHUNK_SIZE = 500 
 OVERLAP = 50 
-LOG_FILE = "atoms_log.json"  # 记录已处理文件的进度
 #client = ollama.Client(host='http://192.168.1.100:11434')     
 
 THEMES = ["self", "relationship", "work", "habit"]
@@ -37,17 +40,15 @@ def get_file_hash(file_path):
     return str(os.path.getmtime(file_path))
 
 def call_remote_ollama(prompt):
-    # 远程服务器的 IP 和端口
-    url = "http://100.90.225.26:11434/api/generate"
-    
     payload = {
-        "model": "rbrain-qwen2.5",
+        "model": MODEL_NAME,
         "prompt": prompt,
-        "stream": False  # 关闭流式输出，直接获取完整回复
+        "stream": False,  # 关闭流式输出，直接获取完整回复
+        "options": {"temperature": 0.1}
     }
     
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(OLLAMA_API, json=payload, timeout=180)
         response.raise_for_status() # 检查状态码
         return response.json()['response']
     except Exception as e:
@@ -73,7 +74,8 @@ def save_to_wiki(ai_output, source_file, original_date):
         parts = [p.strip() for p in line.split('|') if p.strip()]
         if len(parts) < 4: continue
         
-        entity, theme, tags, insight = parts
+        entity, theme, tags, *rest = parts
+        insight = ', '.join(rest)
         safe_name = entity.replace("[[", "").replace("]]", "").replace("/", "-")
         file_path = os.path.join(WIKI_DIR, f"{safe_name}.md")
         
@@ -99,65 +101,61 @@ def process_file():
                 full_path = os.path.join(root, file)
                 # 计算相对路径，方便在 Obsidian 中点击链接
                 rel_path = os.path.relpath(full_path, INPUT_DIR)
-                current_mtime = get_file_hash(full_path)
+                mtime = str(os.path.getmtime(full_path)) # 文件指纹
+                #current_mtime = get_file_hash(full_path)
 
                 # 检查逻辑：如果路径在记录中，且修改时间没变，则跳过
-                if rel_path in processed_log and processed_log[rel_path] == current_mtime:
+                if rel_path in processed_log and processed_log[rel_path] == mtime:
                     print(f"⏭️  Skip (Already processed): {rel_path}")
                     continue
 
-                files_to_process.append((full_path, rel_path, file))
+                files_to_process.append((full_path, rel_path, file, mtime))
 
-    print(f"🔍 Found {len(files_to_process)}  new or updated files.")
+    print(f"🔍 Found {len(files_to_process)}  new or updated files: {len(files_to_process)}.")
     
-    for full_path, rel_path, filename in files_to_process:
+    for full_path, rel_path, filename, mtime in files_to_process:
         """
-        if filename == '2022-08-08-the-log-of-your-life.md' or  filename == '2023-09-04-the-log-of-your-life.md' or  filename == '2024-01-02-the-log-of-your-life.md':
-            return
+        if filename != '2017-04-06-intonation-1.md':
+            continue
         """
         orig_date = extract_original_date(full_path, filename)
-        
-        with open(full_path, 'r', encoding='utf-8') as f:
+        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
 
         print(f"\n📂 Processing: {rel_path} | date: {orig_date}")
-
-        # 标记是否成功保存了至少一个片段
-        saved_successfully = False
     
         # 处理超长文件（2000行分块）
         for i in range(0, len(lines), CHUNK_SIZE - OVERLAP):
             chunk = "".join(lines[i : i + CHUNK_SIZE])
             prompt = f"""
             Task: Extract entities/concepts from the text below.
-            - Themes: {THEMES}
-            - Entity Tags: {ENTITY_TAGS}
-            - Concept Tags: {CONCEPT_TAGS}
-            AI can add its own if none fit.
-            
             STRICT RULES:
-            1. LANGUAGE: Use the SAME LANGUAGE as the source text. DO NOT translate.
-            2. If multiple tags apply, separate with comma.
-            
-            OUTPUT: ENTITY | THEME | TAGS | INSIGHT
-            TEXT: {chunk}
+            - LANGUAGE: Use the SAME LANGUAGE as the source text. DO NOT translate.
+            - FORMAT: EENTITY | THEME | TAGS | INSIGHT. If multiple tags apply, separate with comma.
+            - CATEGORIES: {THEMES}, {ENTITY_TAGS}, {CONCEPT_TAGS}
+            AI can add its own if none fit.
+
+            SOURCE TEXT:
+            {chunk}
             """
+            result = call_remote_ollama(prompt)
+            print(f"\n--- Proposed Atoms: (chunk {i//(CHUNK_SIZE-OVERLAP) + 1}) ---\n{result}")
             
-        result = call_remote_ollama(prompt)
-        print(f"\n--- Proposed Atoms: (chunk {i//(CHUNK_SIZE-OVERLAP) + 1}) ---\n{result}")
-            
-        save_to_wiki(result, rel_path, orig_date)
-        saved_successfully = True
- 
-        """
-        cmd = input("\n[n]skip the file [exit]exit: ").lower()
-        if cmd == 'n':
-            break
-        elif cmd == 'exit':
-            return
-        else:
+            """
+            cmd = input("\n[n]skip the file [exit]exit: ").lower()
+            if cmd == 'n':
+                break
+            elif cmd == 'exit':
+                return
+            else:
+                save_to_wiki(result, rel_path, orig_date)
+            """
             save_to_wiki(result, rel_path, orig_date)
-        """
+
+        # record process
+        processed_log[rel_path] = mtime
+        save_log(processed_log)
+        print(f"✅ 已记录进度: {rel_path}")
 
 
 if __name__ == "__main__":
