@@ -49,7 +49,7 @@ def call_remote_ollama(prompt):
     }
     
     try:
-        response = requests.post(OLLAMA_API, json=payload, timeout=180)
+        response = requests.post(OLLAMA_API, json=payload, timeout=240)
         response.raise_for_status() # 检查状态码
         return response.json()['response']
     except Exception as e:
@@ -159,7 +159,7 @@ def process_file():
         for i in range(0, len(lines), CHUNK_SIZE - OVERLAP):
             chunk = "".join(lines[i : i + CHUNK_SIZE])
             prompt = f"""
-            Task: Extract entities/concepts, insights from the text below.
+            Task: Task: Extract entities/concepts from the text below.
             STRICT RULES:
             - ENTITY GUIDELINES:
                - Use concise, standardized NOUNS (e.g., use 'Perfectionism' instead of 'Feeling perfect' or 'I want to be perfect').
