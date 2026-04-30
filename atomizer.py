@@ -1,6 +1,7 @@
 #import ollama
 import os
 import re
+import string
 import requests
 import json
 from datetime import datetime
@@ -11,7 +12,7 @@ from pathlib import Path
 OLLAMA_API = "http://100.90.225.26:11434/api/generate"
 MODEL_NAME = "rbrain-qwen2.5"
 INPUT_DIR = "./rbrain-wiki/raw"
-WIKI_DIR = "./rbrain-wiki/atoms-notes"
+ATOMS_DIR = "./rbrain-wiki/atoms-notes"
 LOG_FILE = "atoms_log.json"  # 记录已处理文件的进度
 
 CHUNK_SIZE = 500 
@@ -21,7 +22,7 @@ OVERLAP = 50
 THEMES = ["self", "relationship", "work", "habit"]
 ENTITY_TAGS = ["#people", "#places", "#objects", "#projects"]
 CONCEPT_TAGS = ["#ideas", "#patterns", "#emotions", "#principles", "#skills", "#states"]
-
+GARBAGE = string.punctuation + string.whitespace
 
 def load_log():
     """加载已处理文件的记录"""
@@ -65,8 +66,20 @@ def extract_original_date(file_path, filename):
     
     return datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%Y-%m-%d')
 
+def extract_original_date(file_path, filename):
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
+    if date_match: return date_match.group(1)
+    
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        head = f.read(1000)
+        content_date = re.search(r"(\d{4}-\d{2}-\d{2})", head)
+        if content_date: return content_date.group(1)
+    
+    return datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%Y-%m-%d')
+
 def save_to_wiki(ai_output, source_file, original_date):
-    if not os.path.exists(WIKI_DIR): os.makedirs(WIKI_DIR)
+    if not os.path.exists(ATOMS_DIR): 
+        os.makedirs(ATOMS_DIR)
     
     lines = ai_output.strip().split('\n')
     for line in lines:
@@ -77,17 +90,35 @@ def save_to_wiki(ai_output, source_file, original_date):
         entity, theme, tags, *rest = parts
         insight = ', '.join(rest)
         safe_name = entity.replace("[[", "").replace("]]", "").replace("/", "-")
-        file_path = os.path.join(WIKI_DIR, f"{safe_name}.md")
+        safe_name.strip(GARBAGE)
+        file_path = os.path.join(ATOMS_DIR, f"{safe_name}.md")
         
         # Format tags correctly for YAML
-        tag_list = [t.strip() for t in tags.split(',')]
-        
+        #tag_list = [t.strip() for t in tags.split(',')] 
+        current_tag_list = [f"#{t.strip().lstrip('#')}" for t in tags.split(',')]
+        current_tags_str = ", ".join(current_tag_list)
+
         is_new = not os.path.exists(file_path)
+
         with open(file_path, "a", encoding="utf-8") as f:
             if is_new:
-                f.write(f"---\ntheme: {theme}\ntags: {tag_list}\noriginal_date: {original_date}\nsource: \"[[{source_file}]]\"\nstatus: seed\n---\n")
-                f.write(f"# {entity}\n")
-            f.write(f"\n- **{original_date}**: {insight} (Ref: [[{source_file}]])\n")
+                # 第一次创建时：写入 YAML (使用第一个主题和标签作为初始元数据)
+                # 将标签列表转为 JSON 格式以符合 YAML 标准
+                yaml_tags = json.dumps(current_tag_list, ensure_ascii=False)
+                f.write(f"---\ntheme: {theme}\ntags: {yaml_tags}\nstatus: seed\n---\n")
+                f.write(f"# {entity}\n\n")
+                f.write("## 📜 历史追踪 (Historical Insights)\n\n")
+                print(f"✨ Created new entity: [[{safe_name}]]")
+            else:
+                print(f"🔗 Merged into entity: [[{safe_name}]]")
+
+            # 4. 写入核心内容（你想要的格式：Insight + Source + 行内 Tags）
+            # 注意：\n\n 确保了条目之间的空行
+            entry_content = (
+                f"- **{original_date}**: {insight}\n"
+                f"  *(Source: [[{source_file}]] | Tags: {current_tags_str})*\n\n"
+            )
+            f.write(entry_content)
 
 def process_file():
     """使用 os.walk 遍历所有子目录"""
@@ -122,24 +153,34 @@ def process_file():
         with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
 
-        print(f"\n📂 Processing: {rel_path} | date: {orig_date}")
+        print(f"\n📂 Processing: {rel_path} (date: {orig_date})")
     
         # 处理超长文件（2000行分块）
         for i in range(0, len(lines), CHUNK_SIZE - OVERLAP):
             chunk = "".join(lines[i : i + CHUNK_SIZE])
             prompt = f"""
-            Task: Extract entities/concepts from the text below.
+            Task: Extract entities/concepts, insights from the text below.
             STRICT RULES:
-            - LANGUAGE: Use the SAME LANGUAGE as the source text. DO NOT translate.
-            - FORMAT: EENTITY | THEME | TAGS | INSIGHT. If multiple tags apply, separate with comma.
-            - CATEGORIES: {THEMES}, {ENTITY_TAGS}, {CONCEPT_TAGS}
-            AI can add its own if none fit.
+            - ENTITY GUIDELINES:
+               - Use concise, standardized NOUNS (e.g., use 'Perfectionism' instead of 'Feeling perfect' or 'I want to be perfect').
+               - Avoid phrases or sentences. Think of it as a Wiki pagename.
+               - If the entity is a person, use their full name or a consistent nickname.
+            - FORMAT: EENTITY | THEME | TAGS | INSIGHT. 
+               - If multiple tags apply, separate with comma.
+            - CATEGORIES: 
+               - Themes: {THEMES}
+               - Entity Tags: {ENTITY_TAGS}
+               - Concept Tags: {CONCEPT_TAGS}
+               - AI can add its own if none fit.
+            - CONSISTENCY: If you encounter a recurring pattern or idea, always use the EXACT SAME name for the ENTITY.
+            - LANGUAGE:  Never translate the source language. Match the output language to the input language perfectly
 
             SOURCE TEXT:
             {chunk}
             """
+
             result = call_remote_ollama(prompt)
-            print(f"\n--- Proposed Atoms: (chunk {i//(CHUNK_SIZE-OVERLAP) + 1}) ---\n{result}")
+            print(f"\n--- AI 建议: (chunk {i//(CHUNK_SIZE-OVERLAP) + 1}) ---\n{result}")
             
             """
             cmd = input("\n[n]skip the file [exit]exit: ").lower()
