@@ -15,12 +15,14 @@
         - [[actions]] | Sustainable habits, operational frameworks, and system efficiency
         - [[growth-trajectory]] | Synthesis of long-term life patterns, personal evolution, and transformation insights
 
-    - atomization 词条化  -
+    - atomization 词条化  
         - 针对你的目标（自我、关系、工作），建议将词条分为以下几类：
             + [[人/人物名]]: 记录你们的互动模式、对方的喜好、协作的雷区。 
             + [[心/心理机制]]: 如 [[回避型人格]] 或 [[深夜焦虑]]。每当你日记里出现类似情绪，就链接到这里。 
             + [[法/方法论]]: 如 [[快速决策法]] 或 [[Qwen调优技巧]]。 
             + [[事/项目]]: 具体的工作任务，记录起承转合  
+
+        - ENTITY_NAME 是詞條的名稱，也是atom 後的文件名
         - llm 执行 'wiki 重构任务”  
 
         > atomizer.py  
@@ -84,8 +86,10 @@
         > export OLLAMA_HOST="http://100.90.225.26:11434"  
         > ollama run rbrain-gemma3  
 
+- vs code on remote server  
+    > (Ctrl+Shift+P) and remote-SSH: connect to Host  
+        
     
-- SKILL.md defines the personality and rules
 
 
 ####  Directory Structure  

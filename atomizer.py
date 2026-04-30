@@ -100,6 +100,7 @@ def save_to_wiki(ai_output, source_file, original_date):
 
         is_new = not os.path.exists(file_path)
 
+
         with open(file_path, "a", encoding="utf-8") as f:
             if is_new:
                 # 第一次创建时：写入 YAML (使用第一个主题和标签作为初始元数据)
