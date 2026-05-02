@@ -1,122 +1,188 @@
 import os
+import json
 import requests
-import chromadb
+import re
+import hashlib
+import datetime
+import numpy as np
 from tqdm import tqdm
-import time
+from opencc import OpenCC
+from thefuzz import fuzz
 
+# --- 核心配置 ---
 OLLAMA_API = "http://100.90.225.26:11434/api/embeddings"
+EMBED_MODEL = "nomic-embed-text" 
 
-class VectorIndexer:
-    def __init__(self, atoms_dir, db_path="./chroma_db"):
-        # 1. 路径标准化
-        self.atoms_dir = os.path.abspath(atoms_dir)
-        self.db_path = os.path.abspath(db_path)
-        
-        # 2. 初始化持久化客户端
-        # PersistentClient 会自动处理目录创建
-        self.client = chromadb.PersistentClient(path=self.db_path)
-        
-        # 3. 获取或创建集合 (使用 cosine 相似度算法，适合文本)
-        self.collection = self.client.get_or_create_collection(
-            name="atoms_rbrain",
-            metadata={"hnsw:space": "cosine"} 
-        )
-        
-        self.ollama_url = OLLAMA_API
-        self.model = "nomic-embed-text"
+BASE_DIR = os.path.abspath("./rbrain-wiki")
+ATOMS_DIR = os.path.join(BASE_DIR, "atoms")
+SAVE_PATH = os.path.join(BASE_DIR, "vector_index.json")
 
-    def get_embedding_with_retry(self, text, retries=3):
-        """带重试机制的 Embedding 获取，防止 Ollama 偶尔超时"""
-        for i in range(retries):
+class WikiHybridIndexer:
+    def __init__(self):
+        self.cc = OpenCC('s2t')
+        os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+        self.data_store = self._load_index()
+
+    def _load_index(self):
+        """載入現有的索引數據"""
+        if os.path.exists(SAVE_PATH):
             try:
-                response = requests.post(
-                    self.ollama_url,
-                    json={"model": self.model, "prompt": text},
-                    timeout=30
-                )
-                response.raise_for_status()
-                return response.json()["embedding"]
-            except Exception as e:
-                if i == retries - 1:
-                    raise e
-                time.sleep(1)
+                with open(SAVE_PATH, 'r', encoding='utf-8') as f:
+                    # 轉換為字典以利增量比對: {atom_name: data}
+                    return {item['name']: item for item in json.load(f)}
+            except: return {}
+        return {}
 
-    def sync_index(self):
-        """同步索引：只处理新增或修改的文件"""
-        all_files = [f for f in os.listdir(self.atoms_dir) if f.endswith('.md')]
-        
-        # 排除副本文件 (2.md 等)
-        valid_files = [f for f in all_files if not os.path.exists(os.path.join(self.atoms_dir, f[:-3] + " 2.md"))]
-        
-        print(f"🧠 目标目录: {self.atoms_dir}")
-        print(f"📊 待处理文件: {len(valid_files)}")
+    def get_file_hash(self, text):
+        """計算文件內容的 Hash，用於增量檢查"""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-        for file_name in tqdm(valid_files, desc="Indexing Atoms"):
-            file_path = os.path.join(self.atoms_dir, file_name)
+    def clean_content(self, text):
+        """解析內容：返回 (純淨文本, 原始路徑)"""
+        # 1. 提取相對路徑 Source
+        source_match = re.search(r"Source: \[\[\.\./raw/(.*?)\]\]", text)
+        source_rel_path = source_match.group(1) if source_match else "unknown"
+
+        # 2. 清洗 Markdown 雜訊
+        text = re.sub(r'---.*?---', '', text, flags=re.DOTALL) # 移除 YAML
+        text = re.sub(r'\*\(Source:.*?\)\*', '', text)        # 移除 Source 標記行
+        text = re.sub(r'[#`\[\]]', '', text)                  # 移除符號
+        
+        clean_text = self.cc.convert(text).strip()
+        return clean_text, source_rel_path
+
+    def get_embedding(self, text):
+        """調用 Ollama API 獲取向量"""
+        try:
+            res = requests.post(OLLAMA_API, json={
+                "model": EMBED_MODEL, 
+                "prompt": text
+            }, timeout=240)
+            res.raise_for_status()
+            return res.json().get("embedding")
+        except Exception as e:
+            print(f"\n❌ Embedding 失敗: {e}")
+            return None
+
+    def run_indexing(self):
+        """掃描 atoms 目錄，執行增量索引"""
+        if not os.path.exists(ATOMS_DIR):
+            print(f"❌ 錯誤: 找不到目錄 {ATOMS_DIR}")
+            return
+        
+        all_files = [f for f in os.listdir(ATOMS_DIR) if f.endswith('.md')]
+        updated_count = 0
+
+        print(f"🚀 正在檢查 {len(all_files)} 篇原子筆記的變動...")
+
+        for filename in tqdm(all_files):
+            atom_name = filename[:-3]
+            file_path = os.path.join(ATOMS_DIR, filename)
             
-            try:
-                # 获取文件的最后修改时间，作为元数据的一部分
-                mtime = os.path.getmtime(file_path)
-                
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+            with open(file_path, 'r', encoding='utf-8') as f:
+                raw_content = f.read()
 
-                # 分离 YAML Header，只索引正文
-                body_parts = content.split("---")
-                # 如果有 YAML，取最后一部分；如果没有，取全文
-                body = body_parts[-1].strip()
-                
-                if not body:
+            current_hash = self.get_file_hash(raw_content)
+            
+            # 增量比對：如果內容沒變，跳過向量運算
+            if atom_name in self.data_store:
+                if self.data_store[atom_name].get("hash") == current_hash:
                     continue
 
-                # 核心优化：使用 upsert 而非 add
-                # 如果 id (文件名) 已存在，它会更新该向量而不会报错
-                vector = self.get_embedding_with_retry(body)
-                
-                self.collection.upsert(
-                    embeddings=[vector],
-                    documents=[body],
-                    metadatas=[{
-                        "source": file_name, 
-                        "last_modified": mtime,
-                        "char_count": len(body)
-                    }],
-                    ids=[file_name]
-                )
-            except Exception as e:
-                print(f"\n❌ 处理 {file_name} 时出错: {e}")
+            clean_text, source_path = self.clean_content(raw_content)
+            vector = self.get_embedding(clean_text)
+            
+            if vector:
+                self.data_store[atom_name] = {
+                    "name": atom_name,
+                    "source": f"raw/{source_path}",
+                    "text": clean_text,
+                    "vector": vector,
+                    "hash": current_hash,
+                    "updated_at": datetime.datetime.now().isoformat()
+                }
+                updated_count += 1
 
-    def semantic_search(self, query_text, top_k=5):
-        """反向教练模式的核心检索接口"""
-        query_vector = self.get_embedding_with_retry(query_text)
+        # 垃圾回收：移除已經不在目錄中的索引項
+        final_list = [v for k, v in self.data_store.items() if os.path.exists(os.path.join(ATOMS_DIR, k+".md"))]
         
-        results = self.collection.query(
-            query_embeddings=[query_vector],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
-        return results
+        with open(SAVE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(final_list, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ 索引同步完成。更新數量: {updated_count}")
 
-# --- 执行区 ---
+    def search(self, query, top_k=5):
+        """混合檢索：KW 70% / Vec 70% (動態調整)"""
+        query_t = self.cc.convert(query.strip())
+        query_vec = self.get_embedding(query_t)
+        
+        # --- 權重策略優化 ---
+        # 針對你的需求：2 個字（如 "善良"）觸發強關鍵字匹配
+        if len(query_t) <= 2:
+            kw_w, sem_w = 0.8, 0.2
+            mode = "精確鎖定 (Strict)"
+        else:
+            kw_w, sem_w = 0.3, 0.7
+            mode = "語義關聯 (Explore)"
+
+        results = []
+        for name, data in self.data_store.items():
+            # 1. 關鍵字得分 (Fuzzy Match)
+            # 標題完全一致給予額外加權
+            t_score = fuzz.ratio(query_t.lower(), name.lower()) / 100.0
+            c_score = fuzz.partial_ratio(query_t, data['text']) / 100.0
+            kw_score = max(t_score * 1.3, c_score)
+            kw_score = min(kw_score, 1.0)
+
+            # 2. 語義得分 (餘弦相似度)
+            sem_score = 0
+            if query_vec and data['vector']:
+                v1, v2 = np.array(query_vec), np.array(data['vector'])
+                denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+                if denom > 0:
+                    sem_score = np.dot(v1, v2) / denom
+                sem_score = (sem_score + 1) / 2 # 歸一化
+
+            # 3. 混合評分
+            total_score = (kw_score * kw_w) + (sem_score * sem_w)
+
+            # 極端情況：標題完全一致強制置頂
+            if query_t.lower() == name.lower():
+                total_score = 2.0
+
+            results.append({
+                "name": name,
+                "source": data['source'],
+                "score": total_score,
+                "kw": kw_score,
+                "sem": sem_score
+            })
+
+        # 排序並過濾
+        results = sorted(results, key=lambda x: x['score'], reverse=True)[:top_k]
+        
+        print(f"\n🔎 搜尋: '{query_t}' | 策略: {mode}")
+        print("-" * 80)
+        for i, r in enumerate(results):
+            tag = "🎯" if r['score'] >= 1.0 else "🔍"
+            print(f"[{i+1}] {tag} [[{r['name']}]]")
+            print(f"    📂 原文: {r['source']}")
+            print(f"    📊 權重分配: 關鍵字 {r['kw']:.2f}({int(kw_w*100)}%) | 語義 {r['sem']:.2f}({int(sem_w*100)}%)")
+            print("-" * 80)
+
 if __name__ == "__main__":
-    # 配置你的路径
-    # 既然是 Mac mini，建议把 db 放在笔记库同级的 data 文件夹下
-    BASE_PATH = "./rbrain-wiki"
-    ATOMS_DIR = os.path.join(BASE_PATH, "atoms")
-    DB_DIR = os.path.join(BASE_PATH, "vdata/chroma_db")
-
-    indexer = VectorIndexer(atoms_dir=ATOMS_DIR, db_path=DB_DIR)
+    import sys
+    indexer = WikiHybridIndexer()
     
-    # 启动同步
-    start_time = time.time()
-    indexer.sync_index()
-    
-    print(f"\n✅ 索引同步完成！耗时: {time.time() - start_time:.2f}s")
-    
-    # 测试一下你的 5107 分身
-    print("\n🤖 反向教练语义测试：")
-    test_prompt = "分析一下我目前对风险投资的理解逻辑"
-    hits = indexer.semantic_search(test_prompt, top_k=3)
-    
-    for i in range(len(hits['ids'][0])):
-        print(f"[{i+1}] 来源: {hits['metadatas'][0][i]['source']} (距离: {hits['distances'][0][i]:.4f})")
+    # 命令行參數處理
+    if len(sys.argv) > 1 and sys.argv[1] == "--build":
+        indexer.run_indexing()
+    else:
+        # 如果索引不存在則先跑 build
+        if not indexer.data_store:
+            indexer.run_indexing()
+        
+        while True:
+            q = input("\n請輸入搜索詞 (q 退出): ").strip()
+            if q.lower() == 'q': break
+            if q: indexer.search(q)

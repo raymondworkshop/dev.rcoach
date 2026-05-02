@@ -1,76 +1,104 @@
 import os
 import re
-import string
+import json
+import hashlib
+from tqdm import tqdm
 
-class Backlinker:
-    def __init__(self, wiki_dir):
-        self.wiki_dir = wiki_dir
-        self.garbage = string.punctuation + string.whitespace
-        # 核心：动态获取实体索引
-        self.entities = self._get_current_entities()
+# --- 配置區 (與 Atomizer 絕對一致) ---
+BASE_DIR = os.path.abspath("./rbrain-wiki")
+INPUT_DIR = os.path.join(BASE_DIR, "raw")
+ATOMS_DIR = os.path.join(BASE_DIR, "atoms")
+LOG_PATH = os.path.join(BASE_DIR, "backlink_process_log.json")
 
-    def _get_current_entities(self):
-        """从文件夹名中提取现有词库，并按长度降序排列"""
-        if not os.path.exists(self.wiki_dir):
-            return []
+class WikiBacklinker:
+    def __init__(self):
+        self.backlinks_map = {} # { "raw_path": set(atoms) }
+        self.log = self._load_log()
+
+    def _load_log(self):
+        if os.path.exists(LOG_PATH):
+            try:
+                with open(LOG_PATH, 'r', encoding='utf-8') as f: return json.load(f)
+            except: return {}
+        return {}
+
+    def get_hash(self, path):
+        hasher = hashlib.md5()
+        with open(path, 'rb') as f: hasher.update(f.read())
+        return hasher.hexdigest()
+
+    def run(self):
+        # 1. 全量掃描 Atoms (不管 Atomizer 跑了沒，這裡都重新掃一遍目錄)
+        print("🔍 掃描 Atoms 目錄並提取反向引用...")
+        if not os.path.exists(ATOMS_DIR): return
         
-        # 获取文件名（不含 .md 后缀）
-        names = [f[:-3] for f in os.listdir(self.wiki_dir) if f.endswith('.md')]
+        atom_files = [f for f in os.listdir(ATOMS_DIR) if f.endswith('.md')]
+        for f_name in tqdm(atom_files, desc="Indexing"):
+            atom_name = f_name[:-3]
+            with open(os.path.join(ATOMS_DIR, f_name), 'r', encoding='utf-8') as f:
+                content = f.read()
+                # 關鍵：尋找所有指向原始文件的 Source 標籤
+                sources = re.findall(r"Source: \[\[\.\./raw/(.*?)\]\]", content)
+                for src in sources:
+                    if src not in self.backlinks_map: self.backlinks_map[src] = set()
+                    self.backlinks_map[src].add(atom_name)
+
+        # 2. 同步至 Raw 文件
+        print("📝 正在將原子連結織回原始筆記...")
+        new_log = {}
         
-        # 关键逻辑：长词优先。
-        # 理由：防止 "失败恐惧" 被拆解成 "[[失败]]恐惧" 或 "失败[[恐惧]]"
-        names.sort(key=len, reverse=True)
-        return names
+        # 遍歷所有被引用過的 Raw 文件
+        for rel_path, atoms in self.backlinks_map.items():
+            full_path = os.path.abspath(os.path.join(INPUT_DIR, rel_path))
+            if not os.path.exists(full_path): continue
 
-    def apply_backlinks(self):
-        """对原子笔记文件夹执行全量扫描与互联"""
-        if not self.entities:
-            print("⚠️ 词库为空，请先运行 Atomizer 生成笔记。")
-            return
+            # 計算當前 Atoms 集合的特徵
+            sorted_atoms = sorted(list(atoms))
+            atoms_sig = hashlib.md5("".join(sorted_atoms).encode()).hexdigest()
+            raw_hash = self.get_hash(full_path)
 
-        print(f"🕵️ 启动 Backlinker... 目标实体数: {len(self.entities)}")
-        
-        updated_count = 0
-        for root, _, files in os.walk(self.wiki_dir):
-            for file in files:
-                if not file.endswith(".md"): continue
-                
-                file_path = os.path.join(root, file)
-                current_filename = file[:-3] # 当前笔记名
-                
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+            # 增量判斷：如果 Raw 內容和 Atoms 集合都沒變，跳過
+            if self.log.get(rel_path, {}).get('sig') == atoms_sig and \
+               self.log.get(rel_path, {}).get('hash') == raw_hash:
+                new_log[rel_path] = self.log[rel_path]
+                continue
 
-                original_content = content
-                
-                # 遍历词库执行正则替换
-                for entity in self.entities:
-                    # 规则 1：跳过单字词（极易误伤）
-                    if len(entity) <= 1: continue
-                    # 规则 2：跳过自身链接（防止笔记里到处是自己的双链）
-                    if entity == current_filename: continue
-                    
-                    # 规则 3：正则负向断言 (Negative Lookbehind/Lookahead)
-                    # (?<!\[\[) : 前面不能是 [[
-                    # (?!\]\])   : 后面不能是 ]]
-                    # 作用：确保不会把已经打好链接的词再次包装成 [[[[双链]]]]
-                    pattern = rf"(?<!\[\[)({re.escape(entity)})(?!\]\])"
-                    
-                    # 执行替换
-                    content = re.sub(pattern, rf"[[\1]]", content)
+            # 執行寫入
+            print(f" ✨ 更新: {rel_path}")
+            with open(full_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
 
-                if content != original_content:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    print(f"✅ Linked: {file}")
-                    updated_count += 1
+            # 移除舊的 Generated Atoms 區塊
+            new_content = []
+            skip = False
+            for line in lines:
+                if "### 🧠 Generated Atoms" in line:
+                    skip = True
+                    # 順便移除區塊上方的分隔線
+                    if new_content and "---" in new_content[-1]:
+                        new_content.pop()
+                    continue
+                if skip and line.strip() == "": continue # 跳過區塊內的空行
+                if skip and not line.strip().startswith("[[") and not line.strip().startswith(", "):
+                    skip = False # 區塊結束
+                if not skip:
+                    new_content.append(line)
 
-        print(f"🏁 任务完成！共计更新了 {updated_count} 个文件的隐形链接。")
+            # 重新封裝內容並追加新區塊
+            final_text = "".join(new_content).rstrip()
+            final_text += f"\n\n---\n\n### 🧠 Generated Atoms\n"
+            final_text += ", ".join([f"[[{a}]]" for a in sorted_atoms]) + "\n"
 
-# --- 集成运行示例 ---
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(final_text)
+
+            # 更新日誌
+            new_log[rel_path] = {'sig': atoms_sig, 'hash': self.get_hash(full_path)}
+
+        # 3. 儲存日誌
+        with open(LOG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(new_log, f, indent=4)
+        print("✅ Backlinker 同步完成。")
+
 if __name__ == "__main__":
-    # 指向你的原子笔记目录
-    ATOMS_PATH = "./rbrain-wiki/atoms" 
-    
-    linker = Backlinker(ATOMS_PATH)
-    linker.apply_backlinks()
+    WikiBacklinker().run()

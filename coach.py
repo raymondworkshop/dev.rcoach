@@ -1,146 +1,184 @@
 import os
 import requests
-import chromadb
 import datetime
 import re
+import numpy as np
+import json
+from opencc import OpenCC
+from thefuzz import fuzz
 
+# --- 核心配置 ---
 MODEL_NAME = "rbrain-qwen2.5"
+OLLAMA_BASE_URL = "http://localhost:11434/api" 
+EMBED_MODEL = "nomic-embed-text"
 
 class ProfessionalCoach:
-    def __init__(self, atoms_dir, queries_dir, db_path):
-        # 确保路径为绝对路径，防止 Mac mini 下相对路径失效
-        self.atoms_dir = os.path.abspath(atoms_dir)
-        self.queries_dir = os.path.abspath(queries_dir)
+    def __init__(self, base_dir):
+        self.cc = OpenCC('s2t')
+        self.base_dir = os.path.abspath(base_dir)
         
-        # 1. 连接数据库
-        self.client = chromadb.PersistentClient(path=os.path.abspath(db_path))
-        self.collection = self.client.get_collection(name="atoms_rbrain")
+        # 標準路徑定義
+        self.atoms_dir = os.path.join(self.base_dir, "atoms")
+        self.queries_dir = os.path.join(self.base_dir, "raw/queries")
+        self.index_path = os.path.join(self.base_dir, "vector_index.json")
         
-        self.ollama_url = "http://localhost:11434/api"
-        self.model = MODEL_NAME 
+        # 確保存檔目錄存在
+        os.makedirs(self.queries_dir, exist_ok=True)
+        
+        # 載入索引
+        self.data_store = self._load_index()
+        self.model = MODEL_NAME
+
+    def _load_index(self):
+        if os.path.exists(self.index_path):
+            with open(self.index_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        print(f"⚠️ 警告: 找不到索引文件 {self.index_path}，請先執行索引器。")
+        return []
 
     def _get_embedding(self, text):
-        """调用 Ollama 获取向量"""
-        res = requests.post(f"{self.ollama_url}/embeddings", json={
-            "model": "nomic-embed-text",
-            "prompt": text
-        })
-        return res.json()["embedding"]
+        try:
+            res = requests.post(f"{OLLAMA_BASE_URL}/embeddings", json={
+                "model": EMBED_MODEL,
+                "prompt": text
+            }, timeout=30)
+            return res.json()["embedding"]
+        except Exception as e:
+            print(f"❌ Embedding API 出錯: {e}")
+            return None
 
     def retrieve_hybrid(self, query_text, n=6):
         """
-        混合检索核心逻辑：关键词路 + 向量路
+        混合檢索：同步 vector_index.py 的權重邏輯
         """
-        query_vec = self._get_embedding(query_text)
+        query_t = self.cc.convert(query_text.strip())
+        query_vec = self._get_embedding(query_t)
         
-        # --- 路径 A: 向量检索 (Semantic) ---
-        vector_res = self.collection.query(
-            query_embeddings=[query_vec],
-            n_results=n
-        )
+        # 動態權重策略：2 個字為分水嶺
+        if len(query_t) <= 2:
+            kw_w, sem_w = 0.8, 0.2  # 精確模式 (人名、術語)
+        else:
+            kw_w, sem_w = 0.3, 0.7  # 語義模式 (情緒、複雜事件)
 
-        # --- 路径 B: 关键词检索 (Lexical/Metadata) ---
-        # 提取问题中的核心词 (长度 > 1)
-        kws = [w for w in re.split(r'\W+', query_text) if len(w) > 1]
-        
-        kw_docs = []
-        kw_sources = []
-        if kws:
-            # 使用 $contains 算子在 metadata 的 keywords 字段中查找
-            # 只要命中其中一个关键词即可
-            kw_res = self.collection.get(
-                where={"keywords": {"$contains": kws[0]}}, 
-                limit=3
-            )
-            kw_docs = kw_res.get("documents", [])
-            kw_sources = [m["source"] for m in kw_res.get("metadatas", [])]
+        scored_results = []
+        for item in self.data_store:
+            # 1. 關鍵字得分
+            t_score = fuzz.ratio(query_t.lower(), item['name'].lower()) / 100.0
+            c_score = fuzz.partial_ratio(query_t, item['text']) / 100.0
+            kw_score = max(t_score * 1.5, c_score)
+            kw_score = min(kw_score, 1.0)
 
-        # --- 合并去重 ---
-        combined_docs = kw_docs + vector_res['documents'][0]
-        combined_sources = kw_sources + [m['source'] for m in vector_res['metadatas'][0]]
+            # 2. 語義得分
+            sem_score = 0
+            if query_vec and item.get('vector'):
+                v1, v2 = np.array(query_vec), np.array(item['vector'])
+                norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+                if norm > 0:
+                    sem_score = (np.dot(v1, v2) / norm + 1) / 2
+
+            total_score = (kw_score * kw_w) + (sem_score * sem_w)
+            
+            if query_t.lower() == item['name'].lower():
+                total_score = 2.0
+
+            scored_results.append({"item": item, "score": total_score})
+
+        top_results = sorted(scored_results, key=lambda x: x['score'], reverse=True)[:n]
         
-        # 使用 dict.fromkeys 去重并保持顺序
-        final_sources = list(dict.fromkeys(combined_sources))[:n]
-        # 根据去重后的 source 重新整理 context (简化处理)
-        return "\n---\n".join(combined_docs[:n]), final_sources
+        # 構造上下文
+        context_parts = []
+        sources = []
+        for r in top_results:
+            item = r['item']
+            context_parts.append(f"[[{item['name']}]]:\n{item['text'][:500]}")
+            sources.append(item['name'])
+            
+        return "\n---\n".join(context_parts), sources
 
     def save_qa(self, question, answer, sources):
-        """存档到 queries 目录，适配 Backlinker 格式"""
-        if not os.path.exists(self.queries_dir):
-            os.makedirs(self.queries_dir)
-            
+        """
+        存檔至 raw/queries，適配 Obsidian 雙鏈
+        """
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        # 过滤非法字符做文件名
-        safe_q = "".join(x for x in question[:15] if x.isalnum() or x in " _-")
-        filename = f"Q_{timestamp}_{safe_q}.md"
+        # 安全文件名處理：僅保留中英文字符與數字
+        clean_q = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', question)[:15]
+        filename = f"Q_{timestamp}_{clean_q}.md"
         
-        # 构造带有双链链接的内容
-        links = [f"[[{s[:-3]}]]" for s in sources]
+        links = [f"[[{s}]]" for s in sources]
         content = f"""---
 type: coach_qa
 date: {datetime.datetime.now().isoformat()}
-tags: #query #reverse-coach
+tags: #query #reverse-coach #diary-analysis
 ---
 
-# User Query
+# 👤 User Query
 {question}
 
-# Coach Response
+# 🤖 Coach Response
 {answer}
 
-# Related Atoms
+# 🔗 Related Atoms
 {", ".join(links)}
 
 ---
 Source: [[my-ai-coach]]
 """
-        with open(os.path.join(self.queries_dir, filename), "w", encoding="utf-8") as f:
+        file_path = os.path.join(self.queries_dir, filename)
+        with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
         return filename
 
     def ask(self, user_input):
-        # 1. 混合检索背景
         context, sources = self.retrieve_hybrid(user_input)
         
-        # 2. 构造 System Prompt
-        system_prompt = f"""你是一个基于用户 5107 篇个人笔记的反向教练。
-        背景知识：
-        {context}
-        
-        任务：
-        1. 审计用户的想法，指出与过去笔记原则不符的地方。
-        2. 引用相关的笔记名称（如 [[文件名]]）。
-        3. 逻辑严密，语气专业。"""
+        system_prompt = f"""你是一個基於用戶 5000+ 篇個人筆記的反向教練。
+你的角色是透過用戶過去的經歷、行為模式（由背景知識提供），來審核用戶現在的想法。
 
-        # 3. 生成回答
-        res = requests.post(f"{self.ollama_url}/generate", json={
-            "model": self.model,
-            "system": system_prompt,
-            "prompt": user_input,
-            "stream": False
-        })
+背景知識 (Context):
+{context}
+
+任務要求：
+1. 審計用戶的想法，指出與過去一貫原則或歷史行為不符、矛盾或過度重覆的地方。
+2. 必須精確引用相關筆記（格式：[[文件名]]）。
+3. 語氣專業、具批判性且誠懇，像是一個長期觀察用戶的智者。"""
+
+        try:
+            res = requests.post(f"{OLLAMA_BASE_URL}/generate", json={
+                "model": self.model,
+                "system": system_prompt,
+                "prompt": user_input,
+                "stream": False,
+                "options": {"temperature": 0.2}
+            }, timeout=240)
+            answer = res.json().get("response", "AI 響應錯誤")
+        except Exception as e:
+            answer = f"與 Ollama 通信超時或錯誤: {e}"
         
-        answer = res.json().get("response", "AI 响应错误")
-        
-        # 4. 自动存档
+        # 自動存檔
         fname = self.save_qa(user_input, answer, sources)
         return answer, fname
 
 if __name__ == "__main__":
-    # 配置你的本地路径
-    BASE_DIR = "./rbrain-wiki"
-    ATOMS_DIR = os.path.join(BASE_DIR, "atoms")
-    QUERIES_DIR = os.path.join(BASE_DIR, "raw/queries")
-    DB_DIR = os.path.join(BASE_DIR, "vdata/chroma_db")
-
-
-    coach = ProfessionalCoach(ATOMS_DIR, QUERIES_DIR, DB_DIR)
+    # 指向你的 wiki 根目錄
+    wiki_base = "./rbrain-wiki"
+    coach = ProfessionalCoach(wiki_base)
     
-    print("🤖 反向教练就绪 (已启用关键词+向量混合模式)")
+    print("="*40)
+    print("🤖 RBrain Coach ")
+    print(f"📂 存檔路徑: {coach.queries_dir}")
+    print("="*40)
+
     while True:
-        user_q = input("\n👤 你的思考: ")
-        if user_q.lower() in ['exit', 'quit']: break
-        
-        ans, saved = coach.ask(user_q)
-        print(f"\n🧩 反向教练:\n{ans}")
-        print(f"\n💾 存档完成: {saved}")
+        try:
+            user_q = input("\n👤 你的思考: ").strip()
+            if user_q.lower() in ['q', 'exit', 'quit']: break
+            if not user_q: continue
+            
+            print("🧠 正在檢索歷史並構思反饋...")
+            ans, saved = coach.ask(user_q)
+            
+            print(f"\n🧩 反向教練:\n{ans}")
+            print(f"\n💾 對話已存檔: {saved}")
+            
+        except KeyboardInterrupt:
+            break
