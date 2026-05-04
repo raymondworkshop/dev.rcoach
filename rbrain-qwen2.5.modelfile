@@ -1,9 +1,9 @@
 FROM qwen2.5:7b-instruct-q5_K_M
 
 # 上下文設置 (16GB RAM 建議先衝 64K)
-PARAMETER num_ctx 32768
-PARAMETER temperature 0.2
-PARAMETER top_p 0.8
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.1
+PARAMETER top_p 0.85
 PARAMETER repeat_penalty 1.1
 
 # 

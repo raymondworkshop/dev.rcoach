@@ -1,0 +1,11 @@
+# Copy to rbrain.yaml (or rbrain_config.yaml) and adjust.
+# Env vars override these values (see rbrain_config.py).
+
+wiki_root: ./rbrain-wiki
+
+# Ollama HTTP API (no /api suffix)
+ollama_base_url: http://localhost:11434
+
+models:
+  generate: rbrain
+  embed: nomic-embed-text
