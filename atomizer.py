@@ -3,6 +3,7 @@ import os
 import re
 import json
 import spacy
+from spacy.matcher import PhraseMatcher
 import yaml
 import httpx
 import hashlib
@@ -10,7 +11,7 @@ import signal
 import sys
 import time
 from datetime import datetime
-from thefuzz import process, fuzz
+from rapidfuzz import process, fuzz
 from tqdm import tqdm
 from opencc import OpenCC
 from pathlib import Path
@@ -73,24 +74,43 @@ class WikiAtomizer:
         self.stop_requested = False
         signal.signal(signal.SIGINT, self._handle_interrupt)
         
+        # 定義停用實體列表，過濾高頻但無意義的噪音 Atoms
+        self.stop_entities = {
+            "時候", "事情", "東西", "部分", "問題", "其中", "一些", "現在", "今天", "大家", "自己",
+            "一個", "一種", "一樣", "意思", "方法", "過程", "情況", "結果", "方面", "理由", "點子",
+            "甚至", "所以", "但是", "而且", "不過", "因此", "就是", "還是", "什麼", "為什麼", "如何",
+            "如果", "雖然", "可是", "然後", "那麼", "這會", "屬於", "其列", "等於", "其煩", "比起", 
+            "乃是", "不見", "人困惑", "something", "things", "everything", "anything", "people",
+            "person", "someone", "anyone", "everyone", "nothing", "nobody", "anybody", "somebody"
+        }
+
         print("⏳ 正在加載 NLP 模型 (zh/en)...")
         try:
-            self.nlp_zh = spacy.load("zh_core_web_sm", disable=["parser"])
-            # Lemmatizer and parser not needed for POS/NER; saves pipeline passes per doc.
-            self.nlp_en = spacy.load("en_core_web_sm", disable=["lemmatizer", "parser"])
+            # 更激進地禁用組件：attribute_ruler 和 lemmatizer 在不需要還原詞幹的場景下可關閉
+            self.nlp_zh = spacy.load("zh_core_web_sm", disable=["parser", "attribute_ruler", "lemmatizer"])
+            self.nlp_en = spacy.load("en_core_web_sm", disable=["parser", "attribute_ruler", "lemmatizer"])
             print("✅ NLP 模型加載成功")
         except Exception as e:
             print(f"❌ 模型加載失敗: {e}\n提示: 請確保已執行 python -m spacy download zh_core_web_sm")
             exit(1)
 
+        # 初始化 PhraseMatcher
+        self.matcher_zh = PhraseMatcher(self.nlp_zh.vocab, attr="TEXT")
+        self.matcher_en = PhraseMatcher(self.nlp_en.vocab, attr="TEXT")
+        self._init_phrase_matchers()
+
+        # 保留 regex 作為備用（或針對非 Token 化的匹配）
+        self._patterns = self._init_keyword_patterns()
+
         self.entity_cache = [f[:-3] for f in os.listdir(self.wiki_dir) if f.endswith('.md')]
         self.entity_cache_set = set(self.entity_cache)
+        self._normalization_map = {}
         self.processed_log = self._load_log()
         self.http = httpx.Client(timeout=int(os.environ.get("OLLAMA_TIMEOUT", "480")))
         self._current_loop = None
         self._current_tasks = []
         self._current_client = None
-        self._network_concurrency = int(os.environ.get("ATOMIZER_NETWORK_CONCURRENCY", "2"))
+        self._network_concurrency = int(os.environ.get("ATOMIZER_NETWORK_CONCURRENCY", "4"))
         self._spacy_batch = int(os.environ.get("SPACY_BATCH", "64"))
         # Increase batch thresholds to reduce API calls
         self._max_batch_size = int(os.environ.get("ATOMIZER_MAX_BATCH_SIZE", "16"))
@@ -105,6 +125,32 @@ class WikiAtomizer:
         self._slice_chars = int(os.environ.get("ATOMIZER_SLICE_CHARS", "2200"))
         # Split long notes at ATX headings: e.g. 4 = #### / ##### / ###### only. 0 = disable.
         self._heading_min_level = int(os.environ.get("ATOMIZER_HEADING_MIN_LEVEL", "4"))
+
+    def _init_phrase_matchers(self):
+        """將關鍵字列表預先轉換為模式並註冊到 Matcher 中"""
+        groups = {
+            "EMOTION": self.emotion_triggers,
+            "DECISION": self.decision_keywords,
+            "PROBLEM": self.problem_keywords,
+            "LEARNING": self.learning_keywords
+        }
+        
+        for label, lang_map in groups.items():
+            # ZH patterns
+            zh_patterns = list(self.nlp_zh.pipe(lang_map["zh"]))
+            self.matcher_zh.add(label, zh_patterns)
+            
+            # EN patterns
+            en_patterns = list(self.nlp_en.pipe(lang_map["en"]))
+            self.matcher_en.add(label, en_patterns)
+
+    def _init_keyword_patterns(self):
+        p = {}
+        p["emotion"] = re.compile(r"\b(" + "|".join(re.escape(k) for k in self.emotion_triggers["en"]) + r")\b", re.I)
+        p["decision"] = re.compile(r"\b(" + "|".join(re.escape(k) for k in self.decision_keywords["en"]) + r")\b", re.I)
+        p["problem"] = re.compile(r"\b(" + "|".join(re.escape(k) for k in self.problem_keywords["en"]) + r")\b", re.I)
+        p["learning"] = re.compile(r"\b(" + "|".join(re.escape(k) for k in self.learning_keywords["en"]) + r")\b", re.I)
+        return p
 
     def _handle_interrupt(self, signum, frame):
         print("\n\n🛑 [INTERRUPT] 接收到中斷請求，正在保存當前進度並安全退出...")
@@ -158,66 +204,107 @@ class WikiAtomizer:
 
     def get_normalized_name(self, name):
         """實體名歸一化 + 繁簡轉換"""
-        t_name = self.cc.convert(name.strip())
+        raw_name = name.strip()
+        # 1. 檢查本次運行的 Session 緩存
+        if raw_name in self._normalization_map:
+            return self._normalization_map[raw_name]
+
+        # 2. 檢查現有實體庫是否存在精確匹配
+        if raw_name in self.entity_cache_set:
+            self._normalization_map[raw_name] = raw_name
+            return raw_name
+
+        # 3. 檢查繁簡轉換後的精確匹配
+        t_name = self.cc.convert(raw_name)
+        if t_name in self.entity_cache_set:
+            self._normalization_map[raw_name] = t_name
+            return t_name
+
         if not self.entity_cache:
             return t_name
-        if t_name in self.entity_cache_set:
-            return t_name
-        match, score = process.extractOne(t_name, self.entity_cache, scorer=fuzz.token_set_ratio)
-        return match if score >= 90 else t_name
 
-    def _entities_from_doc(self, doc):
+        # 4. 模糊匹配 (使用 RapidFuzz 提升速度)
+        # RapidFuzz 返回 (match, score, index)，thefuzz 返回 (match, score)
+        extracted = process.extractOne(t_name, self.entity_cache, scorer=fuzz.token_set_ratio)
+        result = extracted[0] if (extracted and extracted[1] >= 90) else t_name
+        self._normalization_map[raw_name] = result
+        return result
+
+    def _entities_from_doc(self, doc, return_matches=False):
+        """結合模型 NER 與規則匹配提取實體"""
+        is_zh = doc.lang_ == "zh"
         found = set()
-        for ent in doc.ents:
-            if ent.label_ not in ["DATE", "TIME", "MONEY", "QUANTITY"]:
-                t = ent.text.strip()
-                if len(t) > 1:
-                    found.add((t, ent.label_))
+        keyword_matches = []
 
+        # 0. PhraseMatcher 提取預定義關鍵字 (極速)
+        matcher = self.matcher_zh if is_zh else self.matcher_en
+        matches = matcher(doc)
+        for match_id, start, end in matches:
+            label = doc.vocab.strings[match_id]
+            text = doc[start:end].text
+            found.add((text, f"KEYWORD_{label}"))
+            keyword_matches.append((text, label))
+        
+        # 1. 模型 NER 提取
+        for ent in doc.ents:
+            if ent.label_ not in ["TIME",  "QUANTITY", "ORDINAL", "CARDINAL"]:
+                t = ent.text.strip()
+                if len(t) > 1 and t not in self.stop_entities:
+                    found.add((t, ent.label_))
+        # 2. 強制關鍵字提取 (例如：一定要抓取的決策、問題、情緒，學習關鍵字)
+        text_content = doc.text
+        for kw in self.decision_keywords["zh" if is_zh else "en"]:
+            if kw in text_content:
+                found.add((kw, "KEYWORD_DECISION"))
+
+        # 3. 複合名詞 (Concept) 提取邏輯優化
         max_run = self._max_noun_run
         current_noun = ""
         for token in doc:
             if token.pos_ in ["NOUN", "PROPN"]:
                 piece = token.text
-                if current_noun and len(current_noun) + len(piece) > max_run:
-                    if len(current_noun) > 1:
-                        found.add((current_noun, "CONCEPT"))
-                    current_noun = piece
+                if current_noun:
+                    # 英文概念保留空格，中文不加空格
+                    sep = " " if not is_zh else ""
+                    if len(current_noun) + len(sep) + len(piece) > max_run:
+                        if len(current_noun) > 1 and current_noun not in self.stop_entities:
+                            found.add((current_noun, "CONCEPT"))
+                        current_noun = piece
+                    else:
+                        current_noun += sep + piece
                 else:
-                    current_noun += piece
+                    current_noun = piece
             else:
-                if len(current_noun) > 1:
+                if len(current_noun) > 1 and current_noun not in self.stop_entities:
                     found.add((current_noun, "CONCEPT"))
                 current_noun = ""
-        if len(current_noun) > 1:
+        if len(current_noun) > 1 and current_noun not in self.stop_entities:
             found.add((current_noun, "CONCEPT"))
+        
         return list(found)
 
-    def _find_keywords(self, text, keywords):
-        text_lower = text.lower()
-        matches = []
-        for kw in keywords:
-            if any('\u4e00' <= c <= '\u9fff' for c in kw):
-                if kw in text:
-                    matches.append(kw)
-            else:
-                if re.search(rf"\b{re.escape(kw)}\b", text_lower):
-                    matches.append(kw)
-        return matches
-
+    def _find_keywords(self, text, keywords, pattern_en=None):
+        is_zh = any('\u4e00' <= c <= '\u9fff' for c in text)
+        if is_zh:
+            return [kw for kw in keywords if kw in text]
+        elif pattern_en:
+            return pattern_en.findall(text) 
+        return []
+        
     def detect_emotion_triggers(self, text):
         is_zh = any('\u4e00' <= c <= '\u9fff' for c in text)
         keywords = self.emotion_triggers["zh"] if is_zh else self.emotion_triggers["en"]
-        return self._find_keywords(text, keywords)
+        return self._find_keywords(text, keywords, self._patterns.get("emotion"))
 
     def detect_classification(self, text):
         is_zh = any('\u4e00' <= c <= '\u9fff' for c in text)
+            
         classification = []
-        if self._find_keywords(text, self.decision_keywords["zh" if is_zh else "en"]):
+        if self._find_keywords(text, self.decision_keywords["zh" if is_zh else "en"], self._patterns.get("decision")):
             classification.append("decision")
-        if self._find_keywords(text, self.problem_keywords["zh" if is_zh else "en"]):
+        if self._find_keywords(text, self.problem_keywords["zh" if is_zh else "en"], self._patterns.get("problem")):
             classification.append("problem")
-        if self._find_keywords(text, self.learning_keywords["zh" if is_zh else "en"]):
+        if self._find_keywords(text, self.learning_keywords["zh" if is_zh else "en"], self._patterns.get("learning")):
             classification.append("learning")
         return classification
 
@@ -476,7 +563,7 @@ class WikiAtomizer:
         prompt = f"""
         Task: Audit the entity [[{entity}]] from the provided text.
         Style Guide: {lang_style}
-        [Audit Framework]
+        [Audit Framewor]
         - insight: Concise summary of what happened, Fact-based.
         - logic: Root Cause Analysis. For long essays, find systemic patterns. For fragments/diaries, find the mental trigger.
         - related: Essential causal or logical links to other entities.
@@ -736,7 +823,25 @@ class WikiAtomizer:
 
     def save_to_wiki(self, entity_name, label, audit, rel_source_path, date):
         name = self.get_normalized_name(entity_name)
-        safe_name = re.sub(r'[\\/:*?"<>|#]', '_', name)
+        
+        # Step 1: 清理首尾的非字母數字字符 (移除符號、下劃線、方括號等，僅保留起始的中英文字)
+        cleaned_name = re.sub(r'^[^a-zA-Z0-9\u4e00-\u9fff]+|[^a-zA-Z0-9\u4e00-\u9fff]+$', '', name).strip()
+
+        # Step 2: 將 CamelCase 轉換為帶空格的單詞 (例如 HighPerformance -> High Performance)
+        cleaned_name = re.sub(r'(?<!^)(?=[A-Z])', ' ', cleaned_name).strip()
+        
+        # Step 3: 將剩餘的非字母數字字符 (如 &、下劃線) 替換為空格，避免文件名中出現雜亂符號
+        cleaned_name = re.sub(r'[^a-zA-Z0-9\s\u4e00-\u9fff]', ' ', cleaned_name)
+        
+        # Step 4: 正規化空格並轉換為小寫
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip().lower()
+        
+        # Step 5: 將空格替換為連字符，生成最終安全的文件名
+        safe_name = cleaned_name.replace(' ', '-')
+        
+        # 如果清理後文件名為空，提供一個默認值
+        if not safe_name:
+            safe_name = "untitled-atom"
         file_path = os.path.join(self.wiki_dir, f"{safe_name}.md")
         is_new = not os.path.exists(file_path)
         
@@ -838,6 +943,9 @@ class WikiAtomizer:
             if self.processed_log.get(rel_path) == file_hash: 
                 print(f"⏭️  跳过未改动文件: {rel_path}")
                 continue
+            if 'tv-shows' in rel_path or 'games-of-thrones' in rel_path or '2020-08-24-notes-on-your-assets' in rel_path: 
+                print(f"⏭️  跳过未改动文件: {rel_path}")
+                continue
 
             date_match = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(full_path))
             date = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
@@ -859,9 +967,9 @@ class WikiAtomizer:
             if not self.stop_requested:
                 self.processed_log[rel_path] = file_hash
                 save_counter += 1
-                if save_counter % 5 == 0:
+                if save_counter % 10 == 0:
                     self._save_log()
-                    print(f"✅ 进度已记录: {rel_path} (每5个文件保存)")
+                    print(f"✅ 进度已记录: {rel_path} (每10个文件保存)")
                 else:
                     print(f"✅ 处理完成: {rel_path}")
 
