@@ -7,4 +7,4 @@ The agent incrementally builds and maintains a persistent and compounding wiki. 
 The 'Self-Wiki' also can be used on coaching service.
 
 #### reference
-[LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+&copy; 2026 Bean Workshop Ltd.
